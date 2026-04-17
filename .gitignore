@@ -27,3 +27,4 @@ imx6ull_client/*.bin
 
 *.md
 pc_server/snapshots
+*.txt
