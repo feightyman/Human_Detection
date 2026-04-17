@@ -260,6 +260,13 @@ class SocketStreamProducer(threading.Thread):
         # 保存 socket 引用，以便 stop() 时从外部关闭来打断阻塞的 accept/recv
         self._server_socket: Optional[socket.socket] = None
         self._conn: Optional[socket.socket] = None
+        # 开发板连接后记录其真实 IP（供 AlarmSender 使用）
+        self._peer_ip: Optional[str] = None
+
+    @property
+    def peer_ip(self) -> Optional[str]:
+        """开发板连接后的真实 IP 地址，未连接时为 None。"""
+        return self._peer_ip
 
     # ------------------------------------------------------------------
     #  精确接收 n 字节 —— 解决 TCP 分包问题的核心函数
@@ -315,6 +322,7 @@ class SocketStreamProducer(threading.Thread):
                     continue               # 超时或已停止，重新检查 _running
 
                 self._conn = conn
+                self._peer_ip = conn.getpeername()[0]
                 print(f"[SocketStreamProducer] 开发板已连接: {conn.getpeername()}")
 
                 # ---- 持续接收帧 ----
@@ -336,7 +344,7 @@ class SocketStreamProducer(threading.Thread):
         """等待一个客户端连接，超时返回 None。"""
         try:
             conn, addr = self._server_socket.accept()
-            conn.settimeout(2.0)           # recv 超时，避免永久阻塞
+            conn.settimeout(10.0)          # recv 超时，需大于边缘端心跳间隔(2s)，留足余量
             return conn
         except socket.timeout:
             return None
@@ -546,7 +554,122 @@ class InferenceConsumer(threading.Thread):
 
 
 # ============================================================================
-#  5. 测试入口
+#  5. 报警指令发送器 —— 向 i.MX6ULL 发送 0x01(开) / 0x00(关) 报警指令
+# ============================================================================
+
+class AlarmSender:
+    """
+    报警指令发送器：通过独立的 TCP 连接向 i.MX6ULL 开发板发送报警指令。
+
+    协议格式（极简单字节指令）：
+      0x01 —— 开启报警（蜂鸣器/LED）
+      0x00 —— 关闭报警
+
+    设计要点：
+      - 仅在报警状态**变化**时才发送指令，避免每帧重复发送
+      - 连接失败时不阻塞推理线程，后台自动重试
+      - 线程安全：可从推理线程调用 set_alarm()
+    """
+
+    # 报警指令端口，与视频流端口 (8888) 区分开
+    DEFAULT_PORT = 8889
+
+    def __init__(self, host: str, port: int = DEFAULT_PORT) -> None:
+        self._host = host
+        self._port = port
+        self._sock: Optional[socket.socket] = None
+        self._lock = threading.Lock()
+        self._last_state: Optional[bool] = None   # 上次发送的报警状态
+        self._running = True
+
+    def connect(self) -> bool:
+        """尝试连接开发板报警端口。连接失败返回 False，不会抛异常。"""
+        # 注意：此方法内部会获取 _lock，不可在已持有 _lock 的上下文中调用
+        with self._lock:
+            if self._sock is not None:
+                return True
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(3.0)
+                s.connect((self._host, self._port))
+                s.settimeout(2.0)
+                self._sock = s
+                print(f"[AlarmSender] 已连接报警通道: {self._host}:{self._port}")
+                return True
+            except (OSError, ConnectionError) as e:
+                print(f"[AlarmSender] 连接报警通道失败: {e}")
+                return False
+
+    def _connect_unlocked(self) -> bool:
+        """在已持有 _lock 的情况下尝试连接（不再获取锁）。
+        连接超时设为 1 秒，避免长时间阻塞推理线程。"""
+        if self._sock is not None:
+            return True
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1.0)      # 短超时，不阻塞推理线程
+            s.connect((self._host, self._port))
+            s.settimeout(2.0)
+            self._sock = s
+            print(f"[AlarmSender] 已连接报警通道: {self._host}:{self._port}")
+            return True
+        except (OSError, ConnectionError) as e:
+            print(f"[AlarmSender] 连接报警通道失败: {e}")
+            return False
+
+    def set_alarm(self, alarm_on: bool) -> None:
+        """
+        设置报警状态。仅在状态发生变化时才实际发送指令。
+        由推理线程调用，内部线程安全。
+        """
+        if not self._running:
+            return
+        if alarm_on == self._last_state:
+            return                            # 状态未变化，跳过
+
+        cmd = b'\x01' if alarm_on else b'\x00'
+        self._last_state = alarm_on
+
+        with self._lock:
+            # 若未连接，尝试连接（使用不获取锁的版本，避免死锁）
+            if self._sock is None:
+                if not self._connect_unlocked():
+                    return
+
+            try:
+                self._sock.sendall(cmd)
+                state_str = "开启" if alarm_on else "关闭"
+                print(f"[AlarmSender] 已发送报警指令: {state_str} (0x{cmd[0]:02X})")
+            except (OSError, ConnectionError) as e:
+                print(f"[AlarmSender] 发送报警指令失败: {e}，关闭连接待重连")
+                self._close_sock()
+                self._last_state = None        # 重置状态，下次重新发送
+
+    def _close_sock(self) -> None:
+        """关闭 socket（需在 _lock 内调用）。"""
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+
+    def close(self) -> None:
+        """关闭连接并标记停止，用于程序退出时清理。"""
+        self._running = False
+        with self._lock:
+            # 发送关闭指令（尽力而为）
+            if self._sock is not None:
+                try:
+                    self._sock.sendall(b'\x00')
+                except OSError:
+                    pass
+                self._close_sock()
+        print("[AlarmSender] 报警通道已关闭。")
+
+
+# ============================================================================
+#  6. 测试入口
 # ============================================================================
 
 def main() -> None:

@@ -70,6 +70,18 @@ class VideoDisplayLabel(QLabel):
         return [(p.x(), p.y()) for p in self._points]
 
     @property
+    def polygon_normalized(self) -> List[Tuple[float, float]]:
+        """返回归一化坐标 (0.0~1.0)，用于跨分辨率保存/恢复。
+        坐标 = 像素坐标 / 图像宽高。未闭合或无底图时返回空列表。"""
+        if not self._closed or self._source_pixmap is None:
+            return []
+        img_w = self._source_pixmap.width()
+        img_h = self._source_pixmap.height()
+        if img_w == 0 or img_h == 0:
+            return []
+        return [(p.x() / img_w, p.y() / img_h) for p in self._points]
+
+    @property
     def is_drawing(self) -> bool:
         """是否正在绘制中（有顶点但尚未闭合）。"""
         return len(self._points) > 0 and not self._closed
@@ -85,6 +97,26 @@ class VideoDisplayLabel(QLabel):
         self._source_pixmap = None
         self._display_rect = None
         self.update()
+
+    def set_polygon(self, coords: List[Tuple[int, int]]) -> None:
+        """
+        以编程方式设置多边形（绝对像素坐标）。
+        设置后状态为已闭合，会触发 polygon_finished 信号。
+        """
+        self._points = [QPoint(x, y) for x, y in coords]
+        self._closed = True
+        self.polygon_finished.emit(self.polygon)
+        self.update()
+
+    def set_polygon_normalized(self, norm_coords: List[Tuple[float, float]],
+                                img_w: int, img_h: int) -> None:
+        """
+        用归一化坐标 (0.0~1.0) 恢复多边形，按指定的图像分辨率转换为像素坐标。
+        用于从配置文件恢复警戒区域（跨分辨率通用）。
+        """
+        pixel_coords = [(int(nx * img_w), int(ny * img_h))
+                        for nx, ny in norm_coords]
+        self.set_polygon(pixel_coords)
 
     def set_frame(self, frame: np.ndarray) -> None:
         """

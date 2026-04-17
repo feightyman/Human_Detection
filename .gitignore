@@ -26,3 +26,4 @@ imx6ull_client/*.bin
 *.avi
 
 *.md
+pc_server/snapshots
