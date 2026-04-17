@@ -13,8 +13,9 @@
 ![报警日志与抓拍记录](assets/demo_alarm_log.png)
 
 ### 演示视频
-[![演示视频](assets/video_cover.png)](assets/demo_video.mp4)
-
+<video src="assets/demo_video.mp4" controls="controls" width="100%">
+您的浏览器不支持视频播放。
+</video>
 ## 系统架构
 
 ```
