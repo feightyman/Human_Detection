@@ -39,7 +39,6 @@
 
 ```
 Human_Detection/
-├── CLAUDE.md                   # 项目开发规范
 ├── README.md                   # 本文件
 ├── imx6ull_client/             # 边缘端（C 语言）
 │   └── v4l2_camera.c           # V4L2 采集 + 帧差法 + TCP 推流 + 报警控制
