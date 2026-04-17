@@ -25,6 +25,6 @@ imx6ull_client/*.bin
 *.mp4
 *.avi
 
-*.md
+CLAUDE.md
 pc_server/snapshots
 *.txt
