@@ -2,6 +2,27 @@
 
 基于 **YOLOv8 + ByteTrack + i.MX6ULL 边缘计算** 的端云协同安防系统。边缘端（正点原子 Alpha 开发板）负责视频采集与帧差法运动检测，PC 端负责深度学习推理与报警决策，双端通过 TCP 协同工作。
 
+## 效果演示
+
+<!-- 在此处放置实测视频或截图，示例格式如下：
+
+### 系统运行截图
+![PC 端检测界面](assets/demo_pc_gui.png)
+![开发板终端输出](assets/demo_imx6ull_terminal.png)
+
+### 入侵检测效果
+![警戒区域绘制与入侵报警](assets/demo_intrusion.png)
+![报警日志与抓拍记录](assets/demo_alarm_log.png)
+
+### 演示视频
+[![演示视频](assets/video_cover.png)](assets/demo_video.mp4)
+或使用外链：
+[![Watch the video](assets/video_cover.png)](https://your-video-link)
+
+-->
+
+> **TODO**：在此处添加实测截图或视频。将素材放入 `assets/` 目录，取消上方注释即可显示。
+
 ## 系统架构
 
 ```
