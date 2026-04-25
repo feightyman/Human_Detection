@@ -28,8 +28,9 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QWidget, QComboBox, QSpinBox, QFileDialog,
     QTabWidget, QTableView, QSplitter, QHeaderView, QAbstractItemView,
+    QMessageBox, QMenu,
 )
-from PySide6.QtGui import QStandardItemModel, QStandardItem
+from PySide6.QtGui import QStandardItemModel, QStandardItem, QKeySequence, QShortcut, QGuiApplication, QAction
 
 from video_pipeline import (
     DropOldQueue, BaseDetector, YoloTracker, StreamProducer,
@@ -302,6 +303,55 @@ class InferenceWorker(QThread):
 #  2. 主窗口
 # ============================================================================
 
+class ScalingPreviewLabel(QLabel):
+    """
+    自适应缩放的图片预览 QLabel：
+    - 保存原始 QPixmap 副本（_orig_pixmap）。
+    - 重写 setPixmap：先记录原图，再按当前控件大小做 KeepAspectRatio 缩放显示。
+    - 重写 resizeEvent：在 splitter 拖拽 / 窗口缩放时，根据原图重新生成缩放图，
+      避免反复缩放累积失真，也保证比例不变填充满区域。
+    - clear()：同时清掉原图引用，调用方再 setText 即可显示占位文字。
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._orig_pixmap: Optional[QPixmap] = None
+        # 让 QLabel 在布局中可以被压缩 / 拉伸到任意大小
+        self.setMinimumSize(1, 1)
+        self.setScaledContents(False)         # 我们自己控制缩放，保持纵横比
+
+    def setPixmap(self, pm: QPixmap) -> None:  # type: ignore[override]
+        """记录原图，并按当前尺寸渲染一次。"""
+        if pm is None or pm.isNull():
+            self._orig_pixmap = None
+            super().setPixmap(QPixmap())
+            return
+        self._orig_pixmap = pm
+        self._render_scaled()
+
+    def clear(self) -> None:  # type: ignore[override]
+        """清空预览：原图与显示同时清空。"""
+        self._orig_pixmap = None
+        super().clear()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        # 控件尺寸改变时（例如 splitter 拖拽），用原图重新渲染一次缩放图
+        if self._orig_pixmap is not None:
+            self._render_scaled()
+        super().resizeEvent(event)
+
+    def _render_scaled(self) -> None:
+        """按当前 size 用 KeepAspectRatio 缩放原图后显示。"""
+        if self._orig_pixmap is None:
+            return
+        scaled = self._orig_pixmap.scaled(
+            self.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        super().setPixmap(scaled)
+
+
 class MainWindow(QMainWindow):
     """
     系统主窗口，整合视频显示、多边形绘制、状态面板和后台线程管理。
@@ -327,6 +377,11 @@ class MainWindow(QMainWindow):
 
         # 报警指令发送器（仅 Socket 模式下创建）
         self._alarm_sender: Optional[AlarmSender] = None
+
+        # ---------- 警报日志分页状态 ----------
+        self._alarm_page_size: int = 20      # 每页显示行数
+        self._alarm_page_index: int = 0      # 当前页码（从 0 开始）
+        self._alarm_total_count: int = 0     # 数据库总行数（刷新时更新）
 
         # ---------- UI 控件 ----------
         self._init_ui()
@@ -395,11 +450,12 @@ class MainWindow(QMainWindow):
         self._label_alarm.setFixedHeight(36)
 
         # ---- Tab 1 布局 ----
+        # 注意：_label_status（底部状态栏）已抽出到窗口级别，此处不再加入监控页，
+        #       这样切到"警报日志"页时也能看到提示信息。
         monitor_layout = QVBoxLayout()
         monitor_layout.addWidget(self._video_label, stretch=1)
         monitor_layout.addLayout(ctrl_layout)
         monitor_layout.addWidget(self._label_alarm)
-        monitor_layout.addWidget(self._label_status)
 
         tab_monitor = QWidget()
         tab_monitor.setLayout(monitor_layout)
@@ -413,7 +469,15 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._tab_alarm_log, "警报日志")
         self._tabs.currentChanged.connect(self._on_tab_changed)
 
-        self.setCentralWidget(self._tabs)
+        # ==================== 窗口主布局：QTabWidget + 全局底部状态栏 ====================
+        # _label_status 放在 Tab 之外，所有 Tab 共享同一条提示栏
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(self._tabs, stretch=1)
+        central_layout.addWidget(self._label_status)
+        self.setCentralWidget(central)
 
     def _init_alarm_log_tab(self) -> None:
         """初始化警报日志 Tab 的 UI 控件。"""
@@ -423,24 +487,67 @@ class MainWindow(QMainWindow):
 
         self._alarm_table = QTableView()
         self._alarm_table.setModel(self._alarm_model)
-        self._alarm_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)         # 禁止编辑
-        self._alarm_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)  # 行选模式
-        self._alarm_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)     # 单选模式
-        self._alarm_table.horizontalHeader().setStretchLastSection(True)                        # 最后一列占满剩余宽度
-        self._alarm_table.horizontalHeader().setSectionResizeMode(                              # 前三列列宽自适应
+        # 行选 + 多选（鼠标拖动可滑选多行；Ctrl/Shift 可点选）
+        self._alarm_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._alarm_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        # 单元格不允许编辑，但允许通过键盘焦点选中以支持复制
+        self._alarm_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        # 允许文本被选中复制（QTableView 默认 item 不可被光标内部选中文本，
+        # 这里用右键菜单 + Ctrl+C 提供更稳妥的"复制选中内容"方案）
+        self._alarm_table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self._alarm_table.horizontalHeader().setStretchLastSection(True)
+        self._alarm_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.ResizeToContents
         )
+        # 单击：仅当只选中一行时显示对应抓拍图
         self._alarm_table.clicked.connect(self._on_alarm_row_clicked)
+        # 右键菜单：复制 / 删除选中 / 清空全部
+        self._alarm_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._alarm_table.customContextMenuRequested.connect(self._on_alarm_table_context_menu)
 
-        # ---- 图片预览 ----
-        self._alarm_preview = QLabel("点击表格中的记录查看抓拍图片")
+        # 快捷键：Ctrl+C 复制当前选区（兼容多行/多列）
+        copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self._alarm_table)
+        copy_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+        copy_shortcut.activated.connect(self._copy_alarm_selection)
+        # 快捷键：Delete 直接删除选中行（带确认）
+        del_shortcut = QShortcut(QKeySequence.StandardKey.Delete, self._alarm_table)
+        del_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+        del_shortcut.activated.connect(self._delete_selected_alarms)
+
+        # ---- 图片预览（自适应缩放：splitter 拖拽 / 窗口缩放时自动按比例重绘） ----
+        self._alarm_preview_default_text = "点击表格中的记录查看抓拍图片"
+        self._alarm_preview = ScalingPreviewLabel(self._alarm_preview_default_text)
         self._alarm_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._alarm_preview.setMinimumSize(320, 240)
         self._alarm_preview.setStyleSheet("background-color: #1e1e1e; color: #888;")
 
-        # ---- 刷新按钮 ----
-        btn_refresh = QPushButton("刷新日志")
-        btn_refresh.clicked.connect(self._refresh_alarm_log)
+        # ---- 操作按钮区 ----
+        self._btn_refresh_log = QPushButton("刷新日志")
+        self._btn_refresh_log.clicked.connect(self._on_refresh_clicked)
+
+        self._btn_delete_selected = QPushButton("删除选中")
+        self._btn_delete_selected.clicked.connect(self._delete_selected_alarms)
+
+        self._btn_delete_all = QPushButton("清空全部")
+        self._btn_delete_all.clicked.connect(self._delete_all_alarms)
+
+        # ---- 分页控制区 ----
+        self._btn_prev_page = QPushButton("◀ 上一页")
+        self._btn_prev_page.clicked.connect(self._on_prev_page)
+        self._btn_next_page = QPushButton("下一页 ▶")
+        self._btn_next_page.clicked.connect(self._on_next_page)
+        self._label_page_info = QLabel("第 0 / 0 页（共 0 条）")
+        self._label_page_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._label_page_info.setStyleSheet("color: #ccc;")
+
+        bottom_bar = QHBoxLayout()
+        bottom_bar.addWidget(self._btn_refresh_log)
+        bottom_bar.addWidget(self._btn_delete_selected)
+        bottom_bar.addWidget(self._btn_delete_all)
+        bottom_bar.addStretch(1)
+        bottom_bar.addWidget(self._btn_prev_page)
+        bottom_bar.addWidget(self._label_page_info)
+        bottom_bar.addWidget(self._btn_next_page)
 
         # ---- Splitter 布局：左表格 / 右预览 ----
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -451,7 +558,7 @@ class MainWindow(QMainWindow):
 
         layout = QVBoxLayout()
         layout.addWidget(splitter, stretch=1)
-        layout.addWidget(btn_refresh)
+        layout.addLayout(bottom_bar)
 
         self._tab_alarm_log = QWidget()
         self._tab_alarm_log.setLayout(layout)
@@ -679,13 +786,18 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def _on_tab_changed(self, index: int) -> None:
-        """切换到警报日志 Tab 时自动刷新。"""
+        """切换到警报日志 Tab 时自动刷新，并清空右侧预览图。"""
         if index == 1:
+            self._reset_alarm_preview()
             self._refresh_alarm_log()
 
     @Slot('QModelIndex')
     def _on_alarm_row_clicked(self, index) -> None:
-        """点击报警日志表格某行，在预览区域显示抓拍图片。"""
+        """点击报警日志表格某行，在预览区域显示抓拍图片。
+        多选状态下若选中超过一行，不强制切换预览，避免干扰用户。"""
+        sel_rows = self._alarm_table.selectionModel().selectedRows()
+        if len(sel_rows) > 1:
+            return
         row = index.row()
         # 抓拍路径在第 3 列（序号 0 开始）
         path_item = self._alarm_model.item(row, 3)
@@ -695,21 +807,42 @@ class MainWindow(QMainWindow):
         if os.path.exists(snapshot_path):
             pixmap = QPixmap(snapshot_path)
             if not pixmap.isNull():
-                scaled = pixmap.scaled(
-                    self._alarm_preview.size(),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-                self._alarm_preview.setPixmap(scaled)
+                # ScalingPreviewLabel 内部按 KeepAspectRatio 自适应缩放并跟随 resize 重绘
+                self._alarm_preview.setPixmap(pixmap)
             else:
                 self._alarm_preview.setText("图片加载失败")
         else:
             self._alarm_preview.setText(f"文件不存在:\n{snapshot_path}")
 
     @Slot()
+    def _on_refresh_clicked(self) -> None:
+        """点击「刷新日志」按钮：重置预览图 + 回到第 1 页 + 重新查询。"""
+        self._reset_alarm_preview()
+        self._alarm_page_index = 0
+        self._refresh_alarm_log()
+
+    def _reset_alarm_preview(self) -> None:
+        """清空右侧抓拍预览，恢复成默认占位文字。"""
+        self._alarm_preview.clear()       # 清掉 QPixmap，否则文字不会显示
+        self._alarm_preview.setText(self._alarm_preview_default_text)
+
+    @Slot()
     def _refresh_alarm_log(self) -> None:
-        """从数据库加载报警记录并填充到表格模型。"""
-        rows = alarm_db.query_alarms(limit=200)
+        """根据当前页码 + 每页大小从数据库加载并填充表格。"""
+        # 1) 取总数，调整页码合法性
+        self._alarm_total_count = alarm_db.get_alarm_count()
+        total_pages = max(1, (self._alarm_total_count + self._alarm_page_size - 1)
+                          // self._alarm_page_size)
+        if self._alarm_page_index >= total_pages:
+            self._alarm_page_index = total_pages - 1
+        if self._alarm_page_index < 0:
+            self._alarm_page_index = 0
+
+        # 2) 拉取当前页数据（按 id DESC，offset = page * size）
+        offset = self._alarm_page_index * self._alarm_page_size
+        rows = alarm_db.query_alarms(limit=self._alarm_page_size, offset=offset)
+
+        # 3) 填充模型
         self._alarm_model.removeRows(0, self._alarm_model.rowCount())
         for row_data in rows:
             # row_data: (id, timestamp, intrusion_count, snapshot_path)
@@ -722,6 +855,191 @@ class MainWindow(QMainWindow):
             for item in items:
                 item.setEditable(False)
             self._alarm_model.appendRow(items)
+
+        # 4) 更新页码标签 / 翻页按钮可用状态
+        cur_page_human = 0 if self._alarm_total_count == 0 else self._alarm_page_index + 1
+        total_pages_human = 0 if self._alarm_total_count == 0 else total_pages
+        self._label_page_info.setText(
+            f"第 {cur_page_human} / {total_pages_human} 页（共 {self._alarm_total_count} 条）"
+        )
+        self._btn_prev_page.setEnabled(self._alarm_page_index > 0)
+        self._btn_next_page.setEnabled(self._alarm_page_index < total_pages - 1
+                                       and self._alarm_total_count > 0)
+
+    @Slot()
+    def _on_prev_page(self) -> None:
+        if self._alarm_page_index > 0:
+            self._alarm_page_index -= 1
+            self._reset_alarm_preview()
+            self._refresh_alarm_log()
+
+    @Slot()
+    def _on_next_page(self) -> None:
+        total_pages = max(1, (self._alarm_total_count + self._alarm_page_size - 1)
+                          // self._alarm_page_size)
+        if self._alarm_page_index < total_pages - 1:
+            self._alarm_page_index += 1
+            self._reset_alarm_preview()
+            self._refresh_alarm_log()
+
+    # ------------------------------------------------------------------
+    #  报警日志：右键菜单 / 复制 / 删除
+    # ------------------------------------------------------------------
+
+    # 全局深色 QSS 会让 QLabel 的字色继承为浅灰，
+    # 在 QMessageBox 上看起来发白，对话框文字必须强制为纯黑（#000000），
+    # 同时显式指定按钮颜色，避免对比度太低。
+    _MSGBOX_QSS = (
+        "QMessageBox { background-color: #f0f0f0; }"
+        "QMessageBox QLabel { color: #000000; background: transparent; }"
+        "QMessageBox QPushButton {"
+        "  color: #000000; background: #e1e1e1; border: 1px solid #888;"
+        "  padding: 4px 14px; border-radius: 3px; min-width: 60px; }"
+        "QMessageBox QPushButton:hover { background: #d0d0d0; }"
+    )
+
+    def _show_message(
+        self,
+        icon: QMessageBox.Icon,
+        title: str,
+        text: str,
+        buttons: QMessageBox.StandardButton = QMessageBox.StandardButton.Ok,
+        default_button: QMessageBox.StandardButton = QMessageBox.StandardButton.NoButton,
+    ) -> QMessageBox.StandardButton:
+        """统一构造 QMessageBox：本地 styleSheet 强制文字纯黑，避免被深色全局 QSS 影响。"""
+        box = QMessageBox(self)
+        box.setIcon(icon)
+        box.setWindowTitle(title)
+        box.setText(text)
+        box.setStandardButtons(buttons)
+        if default_button != QMessageBox.StandardButton.NoButton:
+            box.setDefaultButton(default_button)
+        box.setStyleSheet(self._MSGBOX_QSS)
+        return box.exec()
+
+    @Slot('QPoint')
+    def _on_alarm_table_context_menu(self, pos) -> None:
+        """表格右键菜单：复制选中内容 / 删除选中 / 清空全部。"""
+        sel_rows = self._alarm_table.selectionModel().selectedRows()
+        has_selection = len(sel_rows) > 0
+
+        menu = QMenu(self._alarm_table)
+        act_copy = QAction(f"复制选中内容 (Ctrl+C)", menu)
+        act_copy.setEnabled(has_selection)
+        act_copy.triggered.connect(self._copy_alarm_selection)
+        menu.addAction(act_copy)
+
+        menu.addSeparator()
+        act_del_sel = QAction(f"删除选中 ({len(sel_rows)} 条)", menu)
+        act_del_sel.setEnabled(has_selection)
+        act_del_sel.triggered.connect(self._delete_selected_alarms)
+        menu.addAction(act_del_sel)
+
+        act_del_all = QAction("清空全部日志", menu)
+        act_del_all.triggered.connect(self._delete_all_alarms)
+        menu.addAction(act_del_all)
+
+        # 转换为全局坐标显示
+        menu.exec(self._alarm_table.viewport().mapToGlobal(pos))
+
+    def _copy_alarm_selection(self) -> None:
+        """复制当前选区到剪贴板：多行用 \\n 分隔，多列用 \\t 分隔（同 Excel 风格）。"""
+        sel_model = self._alarm_table.selectionModel()
+        if sel_model is None or not sel_model.hasSelection():
+            return
+        indexes = sel_model.selectedIndexes()
+        if not indexes:
+            return
+        # 按 (row, col) 排序后组装
+        indexes_sorted = sorted(indexes, key=lambda i: (i.row(), i.column()))
+        lines: List[str] = []
+        cur_row = indexes_sorted[0].row()
+        cur_cols: List[str] = []
+        for idx in indexes_sorted:
+            if idx.row() != cur_row:
+                lines.append("\t".join(cur_cols))
+                cur_cols = []
+                cur_row = idx.row()
+            cur_cols.append(idx.data() or "")
+        lines.append("\t".join(cur_cols))
+        text = "\n".join(lines)
+        QGuiApplication.clipboard().setText(text)
+        self._label_status.setText(f"已复制 {len(lines)} 行内容到剪贴板")
+
+    def _delete_selected_alarms(self) -> None:
+        """删除当前选中的所有行（带二次确认）。"""
+        sel_rows = self._alarm_table.selectionModel().selectedRows()
+        if not sel_rows:
+            self._show_message(
+                QMessageBox.Icon.Information, "提示",
+                "请先在表格中选择要删除的记录。",
+            )
+            return
+
+        # 收集 id（第 0 列）
+        ids: List[int] = []
+        for idx in sel_rows:
+            id_item = self._alarm_model.item(idx.row(), 0)
+            if id_item is not None:
+                try:
+                    ids.append(int(id_item.text()))
+                except ValueError:
+                    pass
+        if not ids:
+            return
+
+        reply = self._show_message(
+            QMessageBox.Icon.Question, "确认删除",
+            f"确定要删除选中的 {len(ids)} 条报警记录吗？\n"
+            f"对应的抓拍图片也会被一并删除，且不可恢复。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # 执行删除（同步，量小通常瞬时完成；如担心阻塞可改用线程）
+        ok, err, deleted = alarm_db.delete_alarms(ids, remove_snapshots=True)
+        if ok:
+            self._label_status.setText(f"已删除 {deleted} 条报警记录")
+            self._reset_alarm_preview()
+            self._refresh_alarm_log()
+        else:
+            self._show_message(
+                QMessageBox.Icon.Critical, "删除失败",
+                f"数据库删除失败：\n{err}",
+            )
+
+    def _delete_all_alarms(self) -> None:
+        """清空全部报警记录（带二次确认）。"""
+        if self._alarm_total_count == 0:
+            self._show_message(
+                QMessageBox.Icon.Information, "提示",
+                "当前没有任何报警记录可删除。",
+            )
+            return
+
+        reply = self._show_message(
+            QMessageBox.Icon.Warning, "确认清空全部",
+            f"即将删除全部 {self._alarm_total_count} 条报警记录及其抓拍图片，\n"
+            f"该操作不可恢复，是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        ok, err, deleted = alarm_db.delete_all_alarms(remove_snapshots=True)
+        if ok:
+            self._label_status.setText(f"已清空全部报警记录（共 {deleted} 条）")
+            self._alarm_page_index = 0
+            self._reset_alarm_preview()
+            self._refresh_alarm_log()
+        else:
+            self._show_message(
+                QMessageBox.Icon.Critical, "清空失败",
+                f"数据库清空失败：\n{err}",
+            )
 
     @Slot(QImage, int, bool)
     def _on_frame_ready(self, qimg: QImage, count: int, alarm: bool) -> None:

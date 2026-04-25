@@ -114,3 +114,75 @@ def get_alarm_count() -> int:
         count = cursor.fetchone()[0]
         conn.close()
     return count
+
+
+def delete_alarms(ids: List[int], remove_snapshots: bool = True) -> Tuple[bool, str, int]:
+    """
+    批量删除指定 id 的报警记录（同步执行，调用方建议放到后台线程）。
+    返回 (是否成功, 错误信息, 实际删除条数)。
+    """
+    if not ids:
+        return True, "", 0
+    try:
+        snapshot_paths: List[str] = []
+        with _db_lock:
+            conn = sqlite3.connect(str(DB_PATH))
+            # 用 ? 占位符防注入；构造 (?, ?, ?, ...)
+            placeholders = ",".join("?" * len(ids))
+            if remove_snapshots:
+                cursor = conn.execute(
+                    f"SELECT snapshot_path FROM alarm_events WHERE id IN ({placeholders})",
+                    ids,
+                )
+                snapshot_paths = [r[0] for r in cursor.fetchall() if r and r[0]]
+            cursor = conn.execute(
+                f"DELETE FROM alarm_events WHERE id IN ({placeholders})", ids,
+            )
+            deleted = cursor.rowcount
+            conn.commit()
+            conn.close()
+        # 数据库锁释放后再做文件 IO，避免阻塞写入
+        for p in snapshot_paths:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError as e:
+                print(f"[AlarmDB] 抓拍文件删除失败（忽略） {p}: {e}")
+        print(f"[AlarmDB] 已删除报警记录 {deleted} 条（请求 {len(ids)} 条）")
+        return True, "", deleted
+    except Exception as e:
+        err = f"[AlarmDB] 批量删除失败: {e}"
+        print(err)
+        return False, str(e), 0
+
+
+def delete_all_alarms(remove_snapshots: bool = True) -> Tuple[bool, str, int]:
+    """
+    清空全部报警记录（同步执行）。
+    返回 (是否成功, 错误信息, 删除条数)。
+    """
+    try:
+        snapshot_paths: List[str] = []
+        with _db_lock:
+            conn = sqlite3.connect(str(DB_PATH))
+            if remove_snapshots:
+                cursor = conn.execute("SELECT snapshot_path FROM alarm_events")
+                snapshot_paths = [r[0] for r in cursor.fetchall() if r and r[0]]
+            cursor = conn.execute("DELETE FROM alarm_events")
+            deleted = cursor.rowcount
+            # 重置自增 id，使下次插入序号从 1 开始
+            conn.execute("DELETE FROM sqlite_sequence WHERE name='alarm_events'")
+            conn.commit()
+            conn.close()
+        for p in snapshot_paths:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError as e:
+                print(f"[AlarmDB] 抓拍文件删除失败（忽略） {p}: {e}")
+        print(f"[AlarmDB] 已清空所有报警记录，共 {deleted} 条")
+        return True, "", deleted
+    except Exception as e:
+        err = f"[AlarmDB] 清空失败: {e}"
+        print(err)
+        return False, str(e), 0
