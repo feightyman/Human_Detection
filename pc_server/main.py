@@ -216,7 +216,7 @@ class InferenceWorker(QThread):
             inside = False
             if has_polygon:
                 dist = cv2.pointPolygonTest(
-                    polygon.reshape(-1, 1, 2).astype(np.float32),
+                    polygon.reshape(-1, 1, 2).astype(np.float32),           # 优化空间：把 reshape+astype 提到循环外
                     (float(cx), float(cy)),
                     measureDist=False,
                 )
@@ -249,7 +249,8 @@ class InferenceWorker(QThread):
         # ---------- 报警去抖 + 抓拍 + 入库 ----------
         if alarm and not self._last_alarm:
             # False→True 转变：保存抓拍并发射信号
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            now = datetime.now()  # 调一次
+            ts = now.strftime("%Y%m%d_%H%M%S")
             snapshot_name = f"alarm_{ts}.jpg"
             snapshot_path = str(alarm_db.SNAPSHOT_DIR / snapshot_name)
             # 后台线程保存图片，不阻塞推理
@@ -257,7 +258,7 @@ class InferenceWorker(QThread):
                 target=cv2.imwrite, args=(snapshot_path, annotated),
                 daemon=True, name="SnapshotWriter",
             ).start()
-            ts_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ts_iso = now.strftime("%Y-%m-%d %H:%M:%S")
             self.alarm_triggered.emit(ts_iso, intrusion_count, snapshot_path)
         self._last_alarm = alarm
 
@@ -353,7 +354,7 @@ class MainWindow(QMainWindow):
         self._combo_source = QComboBox()
         self._combo_source.addItem("本地摄像头 (0)", 0)
         self._combo_source.addItem("本地摄像头 (1)", 1)
-        self._combo_source.addItem("开发板 Socket (192.168.1.100:8888)", "socket://192.168.1.100:8888")
+        self._combo_source.addItem("开发板 Socket (192.168.5.100:8888)", "socket://192.168.5.100:8888")
         self._combo_source.setEditable(True)
         self._combo_source.setToolTip(
             "输入摄像头编号、视频文件路径、RTSP URL\n"
@@ -363,7 +364,7 @@ class MainWindow(QMainWindow):
         self._btn_browse = QPushButton("浏览文件")
         self._spin_threshold = QSpinBox()
         self._spin_threshold.setRange(1, 50)
-        self._spin_threshold.setValue(3)
+        self._spin_threshold.setValue(1)
         self._spin_threshold.setPrefix("报警阈值: ")
         self._spin_threshold.setSuffix(" 人")
 
@@ -418,15 +419,15 @@ class MainWindow(QMainWindow):
         """初始化警报日志 Tab 的 UI 控件。"""
         # ---- 表格 ----
         self._alarm_model = QStandardItemModel()
-        self._alarm_model.setHorizontalHeaderLabels(["序号", "时间", "入侵人数", "抓拍路径"])
+        self._alarm_model.setHorizontalHeaderLabels(["序号", "时间", "入侵人数", "抓拍路径"])       # 设置列头
 
         self._alarm_table = QTableView()
         self._alarm_table.setModel(self._alarm_model)
-        self._alarm_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._alarm_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._alarm_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._alarm_table.horizontalHeader().setStretchLastSection(True)
-        self._alarm_table.horizontalHeader().setSectionResizeMode(
+        self._alarm_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)         # 禁止编辑
+        self._alarm_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)  # 行选模式
+        self._alarm_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)     # 单选模式
+        self._alarm_table.horizontalHeader().setStretchLastSection(True)                        # 最后一列占满剩余宽度
+        self._alarm_table.horizontalHeader().setSectionResizeMode(                              # 前三列列宽自适应
             QHeaderView.ResizeMode.ResizeToContents
         )
         self._alarm_table.clicked.connect(self._on_alarm_row_clicked)
@@ -557,7 +558,7 @@ class MainWindow(QMainWindow):
 
         # ---- 初始化检测器 ----
         self._label_status.setText("正在加载 YOLOv8 模型...")
-        QApplication.processEvents()
+        QApplication.processEvents()        # 强制处理一轮事件:UI重绘
 
         try:
             detector = YoloTracker(model_path="yolov8n.pt", conf=0.5, device="cuda")
@@ -595,7 +596,7 @@ class MainWindow(QMainWindow):
             detector=detector,
             alarm_threshold=alarm_threshold,
             alarm_sender=self._alarm_sender,
-            parent=None,
+            parent=None,    # 独立的生命周期
         )
 
         # 推理线程信号 → 主线程槽
@@ -682,6 +683,7 @@ class MainWindow(QMainWindow):
         if index == 1:
             self._refresh_alarm_log()
 
+    @Slot('QModelIndex')
     def _on_alarm_row_clicked(self, index) -> None:
         """点击报警日志表格某行，在预览区域显示抓拍图片。"""
         row = index.row()
@@ -704,6 +706,7 @@ class MainWindow(QMainWindow):
         else:
             self._alarm_preview.setText(f"文件不存在:\n{snapshot_path}")
 
+    @Slot()
     def _refresh_alarm_log(self) -> None:
         """从数据库加载报警记录并填充到表格模型。"""
         rows = alarm_db.query_alarms(limit=200)

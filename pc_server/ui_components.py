@@ -77,7 +77,7 @@ class VideoDisplayLabel(QLabel):
             return []
         img_w = self._source_pixmap.width()
         img_h = self._source_pixmap.height()
-        if img_w == 0 or img_h == 0:
+        if img_w <= 0 or img_h <= 0:
             return []
         return [(p.x() / img_w, p.y() / img_h) for p in self._points]
 
@@ -128,7 +128,7 @@ class VideoDisplayLabel(QLabel):
         h, w, ch = frame.shape
         bytes_per_line = ch * w
         # OpenCV BGR → Qt RGB
-        rgb = frame[..., ::-1].copy()
+        rgb = frame[..., ::-1].copy()       # ... 表示"前面所有维度保持不变" ,::-1对最后一个轴（通道轴）做反转
         qimg = QImage(rgb.data, w, h, bytes_per_line,
                       QImage.Format.Format_RGB888)
         self._source_pixmap = QPixmap.fromImage(qimg)
@@ -136,6 +136,8 @@ class VideoDisplayLabel(QLabel):
 
     def set_pixmap_image(self, pixmap: QPixmap) -> None:
         """直接设置 QPixmap 底图。"""
+        if pixmap is None or pixmap.isNull():
+            return
         self._source_pixmap = pixmap
         self.update()
 
@@ -198,7 +200,7 @@ class VideoDisplayLabel(QLabel):
         if self._source_pixmap is None:
             return
 
-        img_pt = self._widget_to_image(event.position().toPoint())
+        img_pt = self._widget_to_image(event.position().toPoint())      # .toPoint() 把 QPointF 转成 QPoint（整数坐标）
         if img_pt is None:
             return                        # 点击在图像之外，忽略
 
@@ -223,7 +225,7 @@ class VideoDisplayLabel(QLabel):
 
     def paintEvent(self, event: QPaintEvent) -> None:
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)         # 打开抗锯齿
 
         # ---------- 1. 绘制底图（按比例缩放居中） ----------
         if self._source_pixmap is not None:
@@ -231,8 +233,8 @@ class VideoDisplayLabel(QLabel):
             ox, oy, dw, dh, _ = self._display_rect
             scaled = self._source_pixmap.scaled(
                 dw, dh,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
+                Qt.AspectRatioMode.KeepAspectRatio,     # 保持宽高比
+                Qt.TransformationMode.SmoothTransformation,     # 平滑缩放
             )
             painter.drawPixmap(ox, oy, scaled)
         else:
@@ -265,7 +267,7 @@ class VideoDisplayLabel(QLabel):
                 painter.drawLine(widget_pts[i], widget_pts[i + 1])
 
         # 绘制每个顶点
-        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setPen(Qt.PenStyle.NoPen)       # NoPen：画圆没边框
         for i, wp in enumerate(widget_pts):
             if self._closed:
                 painter.setBrush(QBrush(QColor(255, 0, 0)))

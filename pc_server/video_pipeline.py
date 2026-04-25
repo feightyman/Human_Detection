@@ -169,11 +169,11 @@ class StreamProducer(threading.Thread):
         source: int | str,              # 0=本地摄像头, 或视频文件路径/RTSP URL
         frame_queue: DropOldQueue,
     ) -> None:
-        super().__init__(daemon=True, name="StreamProducer")
+        super().__init__(daemon=True, name="StreamProducer")    # 设置成守护线程，主线程退出则退出
         self._source = source
         self._queue = frame_queue
-        self._running = threading.Event()
-        self._running.set()
+        self._running = threading.Event()       # 线程安全标志位默认是False
+        self._running.set()                     # 将标志位设置为Ture
 
     # ------------------------------------------------------------------
     def run(self) -> None:
@@ -192,15 +192,15 @@ class StreamProducer(threading.Thread):
               f"{f'  (原始帧率: {fps:.1f} FPS)' if frame_interval > 0 else ''}")
         try:
             while self._running.is_set():
-                t_start = time.perf_counter()
+                t_start = time.perf_counter()   # 记录当前时间戳
 
-                ret, frame = cap.read()
+                ret, frame = cap.read()     # 元组解包,ret：bool,代表这次抓取成功与否
                 if not ret:
                     # 视频文件播放完毕 / 摄像头断开
                     print("[StreamProducer] 视频源读取结束或断开，尝试重连...")
-                    cap.release()
+                    cap.release()       # 释放
                     time.sleep(1.0)
-                    cap = cv2.VideoCapture(self._source)
+                    cap = cv2.VideoCapture(self._source)        # 重连
                     if not cap.isOpened():
                         print("[StreamProducer] 重连失败，退出拉流线程。")
                         break
@@ -211,8 +211,8 @@ class StreamProducer(threading.Thread):
 
                 # 视频文件按原始帧率节流，避免全速读取导致播放加速
                 if frame_interval > 0:
-                    elapsed = time.perf_counter() - t_start
-                    sleep_time = frame_interval - elapsed
+                    elapsed = time.perf_counter() - t_start     # 计算读图 + 塞进队列总共花了多长时间
+                    sleep_time = frame_interval - elapsed       # 这一帧的标准间隔时间，减去刚才消耗的时间，剩下的就是要“睡”的时间
                     if sleep_time > 0:
                         time.sleep(sleep_time)
         finally:
@@ -222,7 +222,7 @@ class StreamProducer(threading.Thread):
     # ------------------------------------------------------------------
     def stop(self) -> None:
         """安全停止拉流线程。"""
-        self._running.clear()
+        self._running.clear()       # 主程序点“停止”按钮时调用。它把（is_set）改成False。
 
 
 # ============================================================================
@@ -258,12 +258,13 @@ class SocketStreamProducer(threading.Thread):
         self._running = threading.Event()
         self._running.set()
         # 保存 socket 引用，以便 stop() 时从外部关闭来打断阻塞的 accept/recv
+        # 执行recv()accept()时程序死等,外部光改变标志位不能停止程序,这里存为成员变量以便主线程从外部操控
         self._server_socket: Optional[socket.socket] = None
         self._conn: Optional[socket.socket] = None
         # 开发板连接后记录其真实 IP（供 AlarmSender 使用）
         self._peer_ip: Optional[str] = None
 
-    @property
+    @property       # 把一个方法（Method）伪装成一个属性（Attribute）。只读。ip = producer.peer_ip 无需括号即可调用
     def peer_ip(self) -> Optional[str]:
         """开发板连接后的真实 IP 地址，未连接时为 None。"""
         return self._peer_ip
@@ -279,12 +280,12 @@ class SocketStreamProducer(threading.Thread):
         因此必须循环拼接，直到收满 n 字节为止。
         返回 None 表示连接已断开。
         """
-        buf = b""
-        while len(buf) < n:
-            if not self._running.is_set():
+        buf = b""       # 准备一个空的二进制容器
+        while len(buf) < n:     # 直到接收到的数据长度够n才退出
+            if not self._running.is_set():      # 这里使用了非阻塞写法防止程序睡死
                 return None
             try:
-                chunk = sock.recv(n - len(buf))
+                chunk = sock.recv(n - len(buf))     # 确保不多拿少拿一字节
             except (OSError, ConnectionError):
                 return None
             if not chunk:
@@ -306,7 +307,7 @@ class SocketStreamProducer(threading.Thread):
             self._server_socket.setsockopt(
                 socket.SOL_SOCKET, socket.SO_REUSEADDR, 1
             )
-            self._server_socket.settimeout(1.0)   # accept 超时，便于检查 _running
+            self._server_socket.settimeout(1.0)   # accept 超时，在后面的 _wait_for_connection 里被捕获并返回 None，这样程序就能进入下一轮循环，便于检查 _running
             self._server_socket.bind((self._host, self._port))
             self._server_socket.listen(1)
             print(f"[SocketStreamProducer] 服务器已启动，监听 {self._host}:{self._port}，等待开发板连接...")
@@ -326,7 +327,7 @@ class SocketStreamProducer(threading.Thread):
                 print(f"[SocketStreamProducer] 开发板已连接: {conn.getpeername()}")
 
                 # ---- 持续接收帧 ----
-                self._receive_frames(conn)
+                self._receive_frames(conn)      # 只要网络没断，程序就会一直停在这一行里面不出来
 
                 # 开发板断开，清理连接，回到等待状态
                 conn.close()
@@ -348,7 +349,7 @@ class SocketStreamProducer(threading.Thread):
             return conn
         except socket.timeout:
             return None
-        except OSError:
+        except OSError:     # 执行stop，关闭套接字捕获异常
             return None
 
     # ------------------------------------------------------------------
@@ -365,7 +366,7 @@ class SocketStreamProducer(threading.Thread):
             if header is None:
                 break                      # 连接断开
 
-            frame_size = struct.unpack("<I", header)[0]
+            frame_size = struct.unpack("<I", header)[0]     # < 表示小端序，I 表示这是一个 Unsigned Int
 
             # 基本合法性校验：防止错误数据导致分配超大内存
             if frame_size == 0 or frame_size > 10 * 1024 * 1024:  # >10MB 视为异常
@@ -380,8 +381,8 @@ class SocketStreamProducer(threading.Thread):
 
             # ---- 步骤 3：JPEG 解码 ----
             try:
-                img_array = np.frombuffer(data, dtype=np.uint8)
-                frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                img_array = np.frombuffer(data, dtype=np.uint8)         # 二进制数据解码成1 维数组（类型是uint8）
+                frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)       # 解压展开得到三维矩阵（高度 x 宽度 x 3个颜色通道 BGR），得到图片；失败返回None
             except Exception as e:
                 print(f"[SocketStreamProducer] imdecode 异常: {e}")
                 continue
@@ -429,7 +430,7 @@ class InferenceConsumer(threading.Thread):
         frame_queue: DropOldQueue,
         detector: BaseDetector,
         polygon: List[Tuple[int, int]],    # 多边形区域顶点坐标列表
-        alarm_threshold: int = 3,          # 区域内人数达到此值触发警报
+        alarm_threshold: int = 1,          # 区域内人数达到此值触发警报
         on_frame_ready: Optional[Callable[[np.ndarray, int], None]] = None,
     ) -> None:
         super().__init__(daemon=True, name="InferenceConsumer")
@@ -439,10 +440,10 @@ class InferenceConsumer(threading.Thread):
         self._running = threading.Event()
         self._running.set()
 
-        # 多边形坐标——线程安全拷贝
+        # 多边形坐标——线程安全拷贝  与UI线程共享资源
         # 未来可通过 update_polygon() 由 UI 线程动态更新
         self._polygon_lock = threading.Lock()
-        self._polygon = np.array(polygon, dtype=np.int32)
+        self._polygon = np.array(polygon, dtype=np.int32)       # 直接把传入的普通 Python 列表转换成 Numpy 矩阵，并强制类型为 32 位整数
 
         # 回调：(标注帧, 区域内人数) → 主线程/UI
         self._on_frame_ready = on_frame_ready
@@ -457,7 +458,7 @@ class InferenceConsumer(threading.Thread):
     def _get_polygon(self) -> np.ndarray:
         """获取多边形坐标的线程安全拷贝。"""
         with self._polygon_lock:
-            return self._polygon.copy()
+            return self._polygon.copy()     # 复制了一份，返回副本的指针
 
     # ------------------------------------------------------------------
     def run(self) -> None:
@@ -490,11 +491,11 @@ class InferenceConsumer(threading.Thread):
         """
         polygon = self._get_polygon()
         detections = self._detector.detect(frame)
-        annotated = frame.copy()
+        annotated = frame.copy()        # 复制一份原始图片用来标注
 
         # ---------- 绘制多边形警戒区域 ----------
         if len(polygon) >= 3:
-            overlay = annotated.copy()
+            overlay = annotated.copy()      # 在 overlay（覆盖层）上画一个实心的红色多边形
             cv2.fillPoly(overlay, [polygon], color=(0, 0, 80))       # 半透明红色填充
             cv2.addWeighted(overlay, 0.3, annotated, 0.7, 0, annotated)
             cv2.polylines(annotated, [polygon], isClosed=True,
@@ -506,7 +507,7 @@ class InferenceConsumer(threading.Thread):
             cx, cy = det.center
             x1, y1, x2, y2 = det.bbox
 
-            # cv2.pointPolygonTest: 返回 >=0 表示点在多边形内部或边上
+            # cv2.pointPolygonTest: (射线法检测)返回 >=0 表示点在多边形内部或边上
             inside = False
             if len(polygon) >= 3:
                 dist = cv2.pointPolygonTest(
@@ -590,9 +591,9 @@ class AlarmSender:
                 return True
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(3.0)
+                s.settimeout(3.0)               # TCP三次握手超时
                 s.connect((self._host, self._port))
-                s.settimeout(2.0)
+                s.settimeout(2.0)               # 发送或接收超时
                 self._sock = s
                 print(f"[AlarmSender] 已连接报警通道: {self._host}:{self._port}")
                 return True
@@ -682,7 +683,7 @@ def main() -> None:
     # -------- 配置 --------
     VIDEO_SOURCE = 0                     # 本地摄像头；可改为视频文件路径
     MODEL_PATH = "yolov8n.pt"
-    ALARM_THRESHOLD = 3                  # 区域内 >=3 人触发警报
+    ALARM_THRESHOLD = 1                  # 区域内 >=3 人触发警报
 
     # 硬编码的多边形警戒区域（四边形，单位：像素坐标）
     # 实际使用时由 UI 鼠标绘制，通过 update_polygon() 传入
@@ -698,7 +699,7 @@ def main() -> None:
     detector = YoloTracker(model_path=MODEL_PATH, conf=0.5)
 
     # 回调：将标注帧存入主线程可读的容器
-    latest_frame_lock = threading.Lock()
+    latest_frame_lock = threading.Lock()        # 一个在写、一个在读，必须加一把 latest_frame_lock 锁
     latest_frame: dict = {"img": None}
 
     def on_frame_ready(img: np.ndarray, count: int) -> None:
