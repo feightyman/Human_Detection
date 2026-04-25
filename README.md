@@ -13,9 +13,11 @@
 ![报警日志与抓拍记录](assets/demo_alarm_log.png)
 
 ### 演示视频
-<video src="assets/demo_video.mp4" controls="controls" width="100%">
-您的浏览器不支持视频播放。
-</video>
+
+
+https://github.com/user-attachments/assets/c065af20-4524-4853-b643-3872e9ec840e
+
+
 ## 系统架构
 
 ```
